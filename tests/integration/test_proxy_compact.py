@@ -279,6 +279,67 @@ async def test_proxy_compact_no_accounts(async_client):
 
 
 @pytest.mark.asyncio
+async def test_proxy_compact_route_strips_chunked_and_connection_headers(async_client, monkeypatch):
+    """A decoded compact request must not leak its inbound HTTP framing upstream."""
+    raw_account_id = "acc_compact_chunked_headers"
+    response = await async_client.post(
+        "/api/accounts/import",
+        files={
+            "auth_json": (
+                "auth.json",
+                json.dumps(_make_auth_json(raw_account_id, "compact-chunked-headers@example.com")),
+                "application/json",
+            )
+        },
+    )
+    assert response.status_code == 200
+
+    session = _JsonSession(_SseResponse())
+
+    @contextlib.asynccontextmanager
+    async def lease_session(session_override=None):
+        assert session_override is None
+        yield session
+
+    monkeypatch.setattr(proxy_client_module, "lease_http_session", lease_session)
+    native_user_agent = "codex_exec/0.151.0 (Ubuntu 24.4.0; x86_64) dumb"
+    response = await async_client.post(
+        "/backend-api/codex/responses/compact",
+        json={"model": "gpt-5.1", "instructions": "compact", "input": []},
+        headers={
+            "User-Agent": native_user_agent,
+            "originator": "codex_exec",
+            "version": "0.151.0",
+            "Authorization": "Bearer inbound-token",
+            "chatgpt-account-id": "inbound-account",
+            "x-codex-session-id": "continuity-session",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "Transfer-Encoding": "chunked",
+            "Connection": "keep-alive, x-client-hop, authorization, chatgpt-account-id, accept, content-type",
+            "Keep-Alive": "timeout=5",
+            "x-client-hop": "drop-me",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert session.calls
+    upstream = {key.lower(): value for key, value in cast(dict[str, str], session.calls[0]["headers"]).items()}
+    assert "transfer-encoding" not in upstream
+    assert "connection" not in upstream
+    assert "keep-alive" not in upstream
+    assert "x-client-hop" not in upstream
+    assert upstream["user-agent"] == native_user_agent
+    assert upstream["originator"] == "codex_exec"
+    assert upstream["version"] == "0.151.0"
+    assert upstream["authorization"] == "Bearer access-token"
+    assert upstream["chatgpt-account-id"] == raw_account_id
+    assert upstream["x-codex-session-id"] == "continuity-session"
+    assert upstream["accept"] == "text/event-stream"
+    assert upstream["content-type"] == "application/json"
+
+
+@pytest.mark.asyncio
 async def test_proxy_compact_rejects_untrimmable_lite_prelude_before_account_selection(async_client):
     payload = {
         "model": "gpt-5.6-sol",
